@@ -1,0 +1,401 @@
+package msc
+
+import (
+	"encoding/binary"
+	"machine"
+	"machine/usb"
+	"machine/usb/descriptor"
+	"machine/usb/msc/csw"
+	"machine/usb/msc/scsi"
+	"time"
+)
+
+type mscState uint8
+
+const (
+	mscStateCmd mscState = iota
+	mscStateData
+	mscStateStatus
+	mscStateStatusSent
+	mscStateNeedReset
+)
+
+const (
+	mscInterface = 2
+)
+
+var MSC *msc
+
+type msc struct {
+	mu            spinLock
+	buf           []byte       // Buffer for incoming/outgoing data
+	blockCache    []byte       // Buffer for block read/write data
+	cachedBlock   int64        // Device offset of the block in blockCache, -1 if none
+	cmdGen        uint32       // Bumped on each CBW and reset so stale tasks are dropped
+	taskGen       uint32       // cmdGen when the task was queued
+	taskCmd       scsi.CmdType // Command type of the queued task
+	taskQueued    bool         // Flag to indicate if the buffer has a task queued
+	rxPending     bool         // OUT transfer waits for AckUsbOutTransfer
+	rxStalled     bool         // Flag to indicate if the RX endpoint is stalled
+	txStalled     bool         // Flag to indicate if the TX endpoint is stalled
+	maxPacketSize uint32       // Maximum packet size for the IN endpoint
+	respStatus    csw.Status   // Response status for the last command
+	sendZLP       bool         // Flag to indicate if a zero-length packet should be sent before sending CSW
+	skipTxDone    bool         // Flag to ignore the late IN completion of a CSW the host already received
+
+	cbw           *CBW   // Last received Command Block Wrapper
+	queuedBytes   uint32 // Number of bytes queued for sending
+	sentBytes     uint32 // Number of bytes sent
+	transferBytes uint32 // Total bytes to send
+	cswBuf        []byte // CSW response buffer
+	state         mscState
+
+	maxLUN       uint8 // Maximum Logical Unit Number (n-1 for n LUNs)
+	dev          machine.BlockDevice
+	blockCount   uint32 // Number of blocks in the device
+	blockOffset  uint32 // Byte offset of the first block in the device for aligned writes
+	blockSizeUSB uint32 // Write block size as presented to the host over USB
+	blockSizeRaw uint32 // Write block size of the underlying device hardware
+	readOnly     bool
+
+	vendorID   [8]byte  // Max 8 ASCII characters
+	productID  [16]byte // Max 16 ASCII characters
+	productRev [4]byte  // Max 4 ASCII characters
+
+	senseKey           scsi.Sense
+	addlSenseCode      scsi.SenseCode
+	addlSenseQualifier uint8
+}
+
+// Port returns the USB Mass Storage port
+func Port(dev machine.BlockDevice) *msc {
+	if MSC == nil {
+		MSC = newMSC(dev)
+	}
+	return MSC
+}
+
+func newMSC(dev machine.BlockDevice) *msc {
+	// Size our buffer to match the maximum packet size of the IN endpoint
+	maxPacketSize := descriptor.EndpointMSCIN.GetMaxPacketSize()
+	m := &msc{
+		// Some platforms require reads/writes to be aligned to the full underlying hardware block
+		cachedBlock:   -1,
+		blockSizeUSB:  512,
+		cswBuf:        make([]byte, csw.MsgLen),
+		cbw:           &CBW{Data: make([]byte, 31)},
+		maxPacketSize: uint32(maxPacketSize),
+	}
+	m.RegisterBlockDevice(dev)
+
+	// Set default inquiry data fields
+	m.SetVendorID("TinyGo")
+	m.SetProductID("Mass Storage")
+	m.SetProductRev("1.0")
+
+	// Initialize the USB Mass Storage Class (MSC) port
+	machine.ConfigureUSBEndpoint(descriptor.MSC,
+		[]usb.EndpointConfig{
+			{
+				Index:        usb.MSC_ENDPOINT_IN,
+				IsIn:         true,
+				Type:         usb.ENDPOINT_TYPE_BULK,
+				TxHandler:    txHandler,
+				StallHandler: setupPacketHandler,
+			},
+			{
+				Index:          usb.MSC_ENDPOINT_OUT,
+				IsIn:           false,
+				Type:           usb.ENDPOINT_TYPE_BULK,
+				DelayRxHandler: rxHandler,
+				StallHandler:   setupPacketHandler,
+			},
+		},
+		[]usb.SetupConfig{
+			{
+				Index:        mscInterface,
+				Handler:      setupPacketHandler,
+				ResetHandler: configurationReset,
+			},
+		},
+	)
+
+	go m.processTasks()
+
+	return m
+}
+
+func (m *msc) processTasks() {
+	// Process tasks that cannot be done in an interrupt context
+	for {
+		state := m.mu.lock()
+		queued, taskCmd, gen := m.taskQueued, m.taskCmd, m.taskGen
+		if taskCmd == scsi.CmdRead {
+			// Clear first since sending the packet lets the next IN
+			// completion queue another read.
+			m.taskQueued = false
+		}
+		m.mu.unlock(state)
+
+		if !queued {
+			time.Sleep(100 * time.Microsecond)
+			continue
+		}
+
+		switch taskCmd {
+		case scsi.CmdRead:
+			m.fillBlockCache(gen)
+			state = m.mu.lock()
+			if gen == m.cmdGen && m.state == mscStateData {
+				m.scsiRead(m.cbw.SCSICmd())
+			}
+			m.mu.unlock(state)
+			continue
+		case scsi.CmdWrite:
+			m.scsiWrite(m.buf, gen)
+		case scsi.CmdUnmap:
+			m.scsiUnmap(gen)
+		}
+
+		// A reset may have queued a new task while this one ran.
+		state = m.mu.lock()
+		if m.taskGen == gen {
+			m.taskQueued = false
+		}
+		if gen == m.cmdGen && m.state == mscStateData {
+			m.queuedBytes = 0
+		}
+		ack := m.rxPending
+		m.rxPending = false
+		m.mu.unlock(state)
+
+		// Acknowledge the received data from the host
+		if ack {
+			machine.AckUsbOutTransfer(usb.MSC_ENDPOINT_OUT)
+		}
+	}
+}
+
+func (m *msc) ready() bool {
+	return m.dev != nil
+}
+
+func (m *msc) resetBuffer(length int) {
+	// Reset the buffer to the specified length
+	m.buf = m.buf[:length]
+	for i := 0; i < length; i++ {
+		m.buf[i] = 0
+	}
+}
+
+func (m *msc) sendUSBPacket(b []byte) {
+	if machine.USBDev.InitEndpointComplete {
+		// Send the USB packet
+		machine.SendUSBInPacket(usb.MSC_ENDPOINT_IN, b)
+	}
+}
+
+func (m *msc) sendCSW(status csw.Status) {
+	// Generate CSW packet into m.cswBuf and send it
+	residue := uint32(0)
+	expected := m.cbw.transferLength()
+	if expected >= m.sentBytes+m.queuedBytes {
+		residue = expected - (m.sentBytes + m.queuedBytes)
+	}
+	m.cbw.CSW(status, residue, m.cswBuf)
+	m.queuedBytes = csw.MsgLen
+	m.state = mscStateStatusSent
+	m.queuedBytes = csw.MsgLen
+	m.sendUSBPacket(m.cswBuf)
+}
+
+func txHandler() {
+	if MSC != nil {
+		MSC.txHandler()
+	}
+}
+
+func (m *msc) txHandler() {
+	state := m.mu.lock()
+	m.run([]byte{}, false)
+	m.mu.unlock(state)
+}
+
+func rxHandler(b []byte) bool {
+	ack := true
+	if MSC != nil {
+		state := MSC.mu.lock()
+		ack = MSC.run(b, true)
+		MSC.mu.unlock(state)
+	}
+	return ack
+}
+
+/*
+	Connection Happy Path Overview:
+
+0. MSC starts out in mscStateCmd status.
+
+1. Host sends CBW (Command Block Wrapper) packet to MSC.
+  - CBW contains the SCSI command to be executed, the length of the data to be transferred, etc.
+
+2. MSC receives CBW.
+  - CBW is validated and saved.
+  - State is changed to mscStateData.
+  - MSC routes the command to the appropriate SCSI command handler.
+
+3. The MSC SCSI command handler responds with the initial data packet (if applicable).
+  - If no data packet is needed, state is changed to mscStateStatus and step 4 is skipped.
+
+4. The host acks the data packet and MSC calls m.scsiDataTransfer() to continue sending (or
+receiving) data.
+  - This cycle continues until all data requested in the CBW is sent/received.
+  - State is changed to mscStateStatus.
+  - MSC waits for the host to ACK the final data packet.
+
+5. MSC then sends a CSW (Command Status Wrapper) to the host to report the final status of the
+command execution and moves to mscStateStatusSent.
+
+6. The host ACKs the CSW and the MSC moves back to mscStateCmd, waiting for the next CBW.
+*/
+func (m *msc) run(b []byte, isEpOut bool) bool {
+	ack := true
+
+	// The host only sends a CBW after it has the previous CSW, so its IN completion may still be pending.
+	// 5 Transport Protocol, Figure 1, https://usb.org/sites/default/files/usbmassbulk_10.pdf
+	if isEpOut && m.state == mscStateStatusSent {
+		m.state = mscStateCmd
+		m.skipTxDone = true
+	} else if !isEpOut && m.skipTxDone {
+		m.skipTxDone = false
+		return ack
+	}
+
+	switch m.state {
+	case mscStateCmd:
+		// Receiving a new command block wrapper (CBW)
+
+		// IN endpoint transfer complete confirmation, no action needed
+		if !isEpOut {
+			return ack
+		}
+
+		// Create a temporary CBW wrapper to validate the incoming data. Has to be temporary
+		// to avoid it escaping into the heap since we're in interrupt context
+		cbw := CBW{Data: b}
+
+		// Verify size and signature
+		if !cbw.validLength() || !cbw.validSignature() {
+			// 6.6.1 CBW Not Valid
+			// https://usb.org/sites/default/files/usbmassbulk_10.pdf
+			m.state = mscStateNeedReset
+			m.stallEndpointIn(usb.MSC_ENDPOINT_IN)
+			m.stallEndpointOut(usb.MSC_ENDPOINT_OUT)
+			m.stallEndpointIn(usb.CONTROL_ENDPOINT)
+			return ack
+		}
+
+		// Save the validated CBW for later reference
+		copy(m.cbw.Data, b)
+		m.cmdGen++
+
+		// Move on to the data transfer phase next go around (after sending the first message)
+		m.state = mscStateData
+		m.transferBytes = cbw.transferLength()
+		m.queuedBytes = 0
+		m.sentBytes = 0
+		m.respStatus = csw.StatusPassed
+		m.sendZLP = false
+
+		m.scsiCmdBegin()
+
+	case mscStateData:
+		// Transfer data
+		ack = m.scsiDataTransfer(b)
+
+	case mscStateStatus:
+	// Sending CSW status response
+	// Placed after the switch statement so we can send the CSW without having to send a packet
+	// to cycle back through this block, e.g. with TEST UNIT READY which sends only a CSW after
+	// setting the sense key/add'l code/qualifier internally
+
+	case mscStateStatusSent:
+		// Wait for the status phase to complete
+		if !isEpOut && m.queuedBytes == csw.MsgLen {
+			// Status confirmed sent, wait for next CBW
+			m.state = mscStateCmd
+		} else {
+			// We're not expecting any data here, ignore it. Original log line:
+			// TU_LOG1("  Warning expect SCSI Status but received unknown data\r\n");
+		}
+
+	case mscStateNeedReset:
+		// Received an invalid CBW message, stop everything until we get reset
+	}
+
+	// Send CSW status response
+	// Placed after the switch statement so we can send the CSW without having to send a packet
+	// to cycle back through this block, e.g. with TEST UNIT READY which sends only a CSW after
+	// setting the sense key/add'l code/qualifier internally
+	if m.state == mscStateStatus && !m.txStalled {
+		if m.cbw.transferLength() > m.sentBytes && m.cbw.isIn() {
+			// 6.7.2 The Thirteen Cases - Case 5 (Hi > Di): STALL before status
+			m.stallEndpointIn(usb.MSC_ENDPOINT_IN)
+		} else if m.sendZLP {
+			// Send a zero-length packet to force the end of the transfer before we send a CSW
+			m.queuedBytes = 0
+			m.sendZLP = false
+			m.sendUSBPacket(m.buf[:0])
+		} else {
+			m.sendCSW(m.respStatus)
+		}
+	}
+
+	return ack
+}
+
+// RegisterBlockDevice registers a BlockDevice provider with the MSC driver
+func (m *msc) RegisterBlockDevice(dev machine.BlockDevice) {
+	m.dev = dev
+	m.cachedBlock = -1
+
+	bufSize := max(dev.WriteBlockSize(), int64(m.maxPacketSize))
+
+	if cap(m.blockCache) != int(bufSize) {
+		m.blockCache = make([]byte, bufSize)
+		m.buf = make([]byte, bufSize)
+	}
+
+	m.blockSizeRaw = uint32(m.dev.WriteBlockSize())
+	m.blockCount = uint32(m.dev.Size()) / m.blockSizeUSB
+	// Read/write/erase operations must be aligned to the underlying hardware blocks. In order to align
+	// them we assume the provided block device is aligned to the end of the underlying hardware block
+	// device and offset all reads/writes by the remaining bytes that don't make up a full block.
+	m.blockOffset = uint32(m.dev.Size()) % m.blockSizeUSB
+
+	// Set VPD UNMAP fields
+	for i := range vpdPages {
+		if vpdPages[i].PageCode == 0xb0 {
+			// 0xb0 - 5.4.5 Block Limits VPD page (B0h)
+			if len(vpdPages[i].Data) >= 28 {
+				// Set the OPTIMAL UNMAP GRANULARITY (write blocks per erase block)
+				granularity := uint32(dev.EraseBlockSize()) / m.blockSizeUSB
+				binary.BigEndian.PutUint32(vpdPages[i].Data[24:28], granularity)
+			}
+			if len(vpdPages[i].Data) >= 32 {
+				// Set the UNMAP GRANULARITY ALIGNMENT (first sector of first full erase block)
+				// The unmap granularity alignment is used to calculate an optimal unmap request starting LBA as follows:
+				// optimal unmap request starting LBA = (n * OPTIMAL UNMAP GRANULARITY) + UNMAP GRANULARITY ALIGNMENT
+				// where n is zero or any positive integer value
+				// https://www.seagate.com/files/staticfiles/support/docs/manual/Interface%20manuals/100293068j.pdf
+
+				// We assume the block device is aligned to the end of the underlying block device
+				blockOffset := uint32(dev.EraseBlockSize()) % m.blockSizeUSB
+				// Set the UGAVALID bit to indicate that the UNMAP GRANULARITY ALIGNMENT is valid
+				blockOffset |= 0x80000000
+				binary.BigEndian.PutUint32(vpdPages[i].Data[28:32], blockOffset)
+			}
+			break
+		}
+	}
+}

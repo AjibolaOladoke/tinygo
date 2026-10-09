@@ -1,0 +1,55 @@
+//go:build gc.none
+
+package runtime
+
+// This GC strategy provides no memory allocation at all. It can be useful to
+// detect where in a program memory is allocated (via linker errors) or for
+// targets that have far too little RAM even for the leaking memory allocator.
+
+import (
+	"sync/atomic"
+	"unsafe"
+)
+
+const needsStaticHeap = false
+
+var gcTotalAlloc uint64 // for runtime.MemStats
+var gcMallocs uint64
+var gcFrees uint64
+var gcScanState atomic.Uint32
+
+func scanCurrentStack() {}
+
+func alloc(size uintptr, layout unsafe.Pointer) unsafe.Pointer
+
+func free(ptr unsafe.Pointer) {
+	// Nothing to free when nothing gets allocated.
+}
+
+//go:noinline
+func freeTaskStack(ptr uintptr) {
+}
+
+func GC() {
+	// Unimplemented.
+}
+
+func mallocs() uint64 {
+	return 0
+}
+
+func markRoots(start, end uintptr) {
+	runtimeFatal("unreachable: markRoots")
+}
+
+func SetFinalizer(obj interface{}, finalizer interface{}) {
+	// Unimplemented.
+}
+
+func initHeap() {
+	// Nothing to initialize.
+}
+
+func setHeapEnd(newHeapEnd uintptr) {
+	// Nothing to do here, this function is never actually called.
+}

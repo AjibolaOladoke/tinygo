@@ -1,0 +1,17 @@
+{
+	"inherits": [
+		"riscv32"
+	],
+	"build-tags": [
+		"tkey"
+	],
+	"features": "+32bit,+c,+zmmul,-relax",
+	"cflags": [
+		"-march=rv32iczmmul"
+	],
+	"linkerscript": "targets/tkey.ld",
+	"scheduler": "none",
+	"gc": "conservative",
+	"flash-command": "tkey-runapp {bin}",
+	"serial": "uart"
+}

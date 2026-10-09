@@ -1,0 +1,21 @@
+{
+	"inherits": [
+		"riscv32"
+	],
+	"features": "+32bit,+a,+c,+m,+zaamo,+zalrsc,+zihintpause,+zmmul,-relax",
+	"build-tags": [
+		"virt",
+		"qemu"
+	],
+	"scheduler": "cores",
+	"default-stack-size": 16384,
+	"cflags": [
+		"-march=rv32imaczihintpause",
+		"-DTINYGO_CORES=4"
+	],
+	"ldflags": [
+		"--defsym=__num_stacks=4"
+	],
+	"linkerscript": "targets/riscv-qemu.ld",
+	"emulator": "qemu-system-riscv32 -machine virt,aclint=on -smp 4 -nographic -bios none -device virtio-rng-device -kernel {}"
+}

@@ -1,0 +1,57 @@
+//go:build scheduler.none
+
+package task
+
+import "unsafe"
+
+// There is only one goroutine so the task struct can be a global.
+var mainTask Task
+
+//go:linkname runtimePanicSchedulerDisabled runtime.runtimePanicSchedulerDisabled
+func runtimePanicSchedulerDisabled()
+
+func Pause() {
+	runtimePanicSchedulerDisabled()
+}
+
+func Current() *Task {
+	// Return a task struct, which is used for the recover builtin for example.
+	return &mainTask
+}
+
+func NumGoroutine() int {
+	return 1
+}
+
+func CoroExit(next *Task) {
+	runtimePanicSchedulerDisabled()
+}
+
+//go:noinline
+func start(fn uintptr, args unsafe.Pointer, stackSize uintptr) {
+	// The compiler will error if this is reachable.
+	runtimePanicSchedulerDisabled()
+}
+
+type state struct{}
+
+func (t *Task) Resume() {
+	runtimePanicSchedulerDisabled()
+}
+
+// OnSystemStack returns whether the caller is running on the system stack.
+func OnSystemStack() bool {
+	// This scheduler does not do any stack switching.
+	return true
+}
+
+func SystemStack() uintptr {
+	// System stack is the current stack, so this shouldn't be called.
+	runtimePanicSchedulerDisabled()
+	return 0 // unreachable
+}
+
+func GoroutineStack() uintptr {
+	// No separate goroutine stack without a scheduler.
+	return 0
+}

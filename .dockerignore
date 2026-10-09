@@ -1,0 +1,4 @@
+build/
+llvm-*/
+!llvm-version.txt
+.github

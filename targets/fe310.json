@@ -1,0 +1,11 @@
+{
+	"inherits": [
+		"riscv32"
+	],
+	"cpu": "sifive-e31",
+	"features": "+32bit,+a,+c,+m,+zaamo,+zalrsc,+zmmul,-relax",
+	"build-tags": [
+		"fe310",
+		"sifive"
+	]
+}

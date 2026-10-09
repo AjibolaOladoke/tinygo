@@ -1,0 +1,47 @@
+//go:build (linux || darwin || windows || wasip1) && !wasip2 && !baremetal && !wasm_unknown
+
+package runtime
+
+// Update the C environment if cgo is loaded.
+// Called from Go 1.20 and above.
+//
+//go:linkname syscallSetenv syscall.runtimeSetenv
+func syscallSetenv(key, value string) {
+	keydata := cstring(key)
+	valdata := cstring(value)
+	setenv(&keydata[0], &valdata[0])
+	if key == "GODEBUG" && godebugUpdate != nil {
+		// Starting with Go 1.20, we need to call a callback (set by
+		// internal/godebug) to notify the GODEBUG environment variable has
+		// changed. This is necessary to get archive/zip to pass tests.
+		godebugUpdate(key, value)
+	}
+}
+
+// Update the C environment if cgo is loaded.
+// Called from Go 1.20 and above.
+//
+//go:linkname syscallUnsetenv syscall.runtimeUnsetenv
+func syscallUnsetenv(key string) {
+	keydata := cstring(key)
+	unsetenv(&keydata[0])
+}
+
+// Clear the environment.
+// Called from Go 1.26 and above.
+//
+//go:linkname syscallClearenv syscall.runtimeClearenv
+func syscallClearenv(env map[string]int) {
+	for k := range env {
+		syscallUnsetenv(k)
+	}
+}
+
+// cstring converts a Go string to a C string.
+// borrowed from syscall
+func cstring(s string) []byte {
+	data := make([]byte, len(s)+1)
+	copy(data, s)
+	// final byte should be zero from the initial allocation
+	return data
+}

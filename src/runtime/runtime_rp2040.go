@@ -1,0 +1,61 @@
+//go:build rp2040
+
+package runtime
+
+import (
+	"device/rp"
+	"runtime/interrupt"
+)
+
+const (
+	sioIrqFifoProc0 = rp.IRQ_SIO_IRQ_PROC0
+	sioIrqFifoProc1 = rp.IRQ_SIO_IRQ_PROC1
+)
+
+// The Cortex-M0+ has no exclusive access instructions, so there is nothing to
+// set up per core.
+func initCore() {
+}
+
+// On RP2040, each core has its own SIO FIFO IRQ. Core0 enables
+// IRQ_SIO_IRQ_PROC0 and Core1 enables IRQ_SIO_IRQ_PROC1, so each handler can
+// use a fixed core ID.
+func enableSIOFifoInterruptCore0() {
+	intr := interrupt.New(sioIrqFifoProc0, handleSIOFifoInterruptCore0)
+	intr.Enable()
+	intr.SetPriority(0xff)
+}
+
+func enableSIOFifoInterruptCore1() {
+	intr := interrupt.New(sioIrqFifoProc1, handleSIOFifoInterruptCore1)
+	intr.Enable()
+	intr.SetPriority(0xff)
+}
+
+// The SIO FIFO IRQ is the logical OR of the VLD, WOF and ROE status bits, so
+// it can fire with no data to read. RP2040 datasheet section 2.3.1.5.
+func handleSIOFifoInterruptCore0(intr interrupt.Interrupt) {
+	rp.SIO.FIFO_ST.Set(rp.SIO_FIFO_ST_ROE | rp.SIO_FIFO_ST_WOF)
+	if !multicore_fifo_rvalid() {
+		return
+	}
+	switch rp.SIO.FIFO_RD.Get() {
+	case rp2SIOFIFOCommandGC:
+		gcInterruptHandler(0)
+	case rp2SIOFIFOCommandFlashSafe:
+		rp2FlashSafeInterruptHandler()
+	}
+}
+
+func handleSIOFifoInterruptCore1(intr interrupt.Interrupt) {
+	rp.SIO.FIFO_ST.Set(rp.SIO_FIFO_ST_ROE | rp.SIO_FIFO_ST_WOF)
+	if !multicore_fifo_rvalid() {
+		return
+	}
+	switch rp.SIO.FIFO_RD.Get() {
+	case rp2SIOFIFOCommandGC:
+		gcInterruptHandler(1)
+	case rp2SIOFIFOCommandFlashSafe:
+		rp2FlashSafeInterruptHandler()
+	}
+}

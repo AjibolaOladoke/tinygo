@@ -1,0 +1,209 @@
+package msc
+
+import (
+	"machine"
+	"machine/usb"
+	"machine/usb/msc/scsi"
+)
+
+func setupPacketHandler(setup usb.Setup) bool {
+	if MSC != nil {
+		return MSC.setupPacketHandler(setup)
+	}
+	return false
+}
+
+// setupPacketHandler runs in the USB interrupt, so it unlocks without defer.
+func (m *msc) setupPacketHandler(setup usb.Setup) bool {
+	state := m.mu.lock()
+	ok := false
+	wValue := (uint16(setup.WValueH) << 8) | uint16(setup.WValueL)
+	switch setup.BRequest {
+	case usb.CLEAR_FEATURE:
+		if setup.BmRequestType == 0x02 { // Host-to-Device | Standard | Endpoint
+			ok = m.handleClearFeature(setup, wValue)
+		}
+	case usb.GET_MAX_LUN:
+		if setup.BmRequestType == 0xA1 { // Device-to-Host | Class | Interface
+			ok = m.handleGetMaxLun(setup, wValue)
+		}
+	case usb.MSC_RESET:
+		if setup.BmRequestType == 0x21 { // Host-to-Device | Class | Interface
+			ok = m.handleReset(setup, wValue)
+		}
+	}
+	m.mu.unlock(state)
+	return ok
+}
+
+// Handles the CLEAR_FEATURE request for clearing ENDPOINT_HALT/stall
+func (m *msc) handleClearFeature(setup usb.Setup, wValue uint16) bool {
+	ok := false
+	// wValue is the feature selector (0x00 for ENDPOINT_HALT)
+	// We aren't handling any other feature selectors
+	// https://wiki.osdev.org/Universal_Serial_Bus#CLEAR_FEATURE
+	if wValue != 0 {
+		return ok
+	}
+	// Clearing the stall is not enough, continue stalling until a reset is received first
+	// 6.6.1 CBW Not Valid
+	// If the CBW is not valid, the device shall STALL the Bulk-In pipe. Also, the device
+	// shall either STALL the Bulk-Out pipe, or the device shall accept and discard any
+	// Bulk-Out data. The device shall maintain this state until a Reset Recovery
+	// For Reset Recovery the host shall issue in the following order: :
+	// (a) a Bulk-Only Mass Storage Reset (handleReset())
+	// (b) a Clear Feature HALT to the Bulk-In endpoint (clear stall IN)
+	// (c) a Clear Feature HALT to the Bulk-Out endpoint (clear stall OUT)
+	// https://usb.org/sites/default/files/usbmassbulk_10.pdf
+
+	if m.state == mscStateNeedReset {
+		wIndex := uint8(setup.WIndex & 0x7F)
+		if wIndex == usb.MSC_ENDPOINT_IN {
+			if (setup.WIndex & 0x80) != 0 {
+				m.stallEndpointIn(wIndex)
+			} else {
+				m.stallEndpointOut(wIndex)
+			}
+		}
+		machine.SendZlp()
+		return true
+	}
+
+	wIndex := uint8(setup.WIndex & 0x7F)
+	isIn := (setup.WIndex & 0x80) != 0
+	if wIndex == usb.MSC_ENDPOINT_IN {
+		if isIn {
+			m.clearStallEndpointIn(wIndex)
+		} else {
+			m.clearStallEndpointOut(wIndex)
+		}
+		ok = true
+	}
+
+	if ok {
+		machine.SendZlp()
+	}
+
+	// Send a CSW if needed to resume after the IN endpoint stall is cleared
+	if m.state == mscStateStatus && isIn && wIndex == usb.MSC_ENDPOINT_IN {
+		m.sendCSW(m.respStatus)
+	}
+
+	return ok
+}
+
+// 3.2 Get Max LUN
+// https://usb.org/sites/default/files/usbmassbulk_10.pdf
+func (m *msc) handleGetMaxLun(setup usb.Setup, wValue uint16) bool {
+	if setup.WIndex != mscInterface || setup.WLength != 1 || wValue != 0 {
+		return false
+	}
+	// Send the maximum LUN ID number (zero-indexed, so n-1) supported by the device
+	m.resetBuffer(1) // Shrink buffer to 1 byte
+	m.buf[0] = m.maxLUN
+	return machine.SendUSBInPacket(usb.CONTROL_ENDPOINT, m.buf)
+}
+
+// 3.1 Bulk-Only Mass Storage Reset
+// https://usb.org/sites/default/files/usbmassbulk_10.pdf
+func (m *msc) handleReset(setup usb.Setup, wValue uint16) bool {
+	if setup.WIndex != mscInterface || setup.WLength != 0 || wValue != 0 {
+		return false
+	}
+	m.resetState()
+
+	// Send a zero-length packet (ZLP) to indicate the reset is complete
+	machine.SendZlp()
+
+	// Return true to indicate successful reset
+	return true
+}
+
+// configurationReset runs when the host sets the configuration, for example
+// after a USB reset in the middle of a transfer.
+func configurationReset() {
+	if MSC != nil {
+		state := MSC.mu.lock()
+		MSC.resetState()
+		MSC.txStalled = false
+		MSC.rxStalled = false
+		// The endpoints were set up again, so a stale task must not ack OUT.
+		MSC.rxPending = false
+		MSC.mu.unlock(state)
+	}
+}
+
+// resetState goes back to waiting for a CBW and drops any queued read.
+func (m *msc) resetState() {
+	m.state = mscStateCmd
+	m.skipTxDone = false
+	m.cmdGen++
+	m.cachedBlock = -1
+	if m.taskCmd == scsi.CmdRead {
+		// A queued read does not own m.buf, so drop it now.
+		m.taskQueued = false
+	}
+	m.resetBuffer(0)
+	m.senseKey = 0
+	m.addlSenseCode = 0
+	m.addlSenseQualifier = 0
+}
+
+func (m *msc) stallEndpointIn(ep uint8) {
+	if ep == usb.CONTROL_ENDPOINT {
+		machine.USBDev.SetStallEPIn(usb.CONTROL_ENDPOINT)
+		return
+	}
+	m.txStalled = true
+	machine.USBDev.SetStallEPIn(uint32(ep))
+}
+
+func (m *msc) stallEndpointOut(ep uint8) {
+	m.rxStalled = true
+	machine.USBDev.SetStallEPOut(uint32(ep))
+}
+
+func (m *msc) clearStallEndpointIn(ep uint8) {
+	machine.USBDev.ClearStallEPIn(uint32(ep))
+	m.txStalled = false
+}
+
+func (m *msc) clearStallEndpointOut(ep uint8) {
+	machine.USBDev.ClearStallEPOut(uint32(ep))
+	m.rxStalled = false
+}
+
+func (m *msc) setStringField(field []byte, value string) {
+	copy(field, []byte(value))
+	for i := len(value); i < len(field); i++ {
+		field[i] = 0x20 // Fill remaining bytes with spaces
+	}
+}
+
+func (m *msc) SetVendorID(vendorID string) {
+	m.setStringField(m.vendorID[:], vendorID)
+}
+
+func (m *msc) SetProductID(productID string) {
+	m.setStringField(m.productID[:], productID)
+}
+
+func (m *msc) SetProductRev(productRev string) {
+	m.setStringField(m.productRev[:], productRev)
+}
+
+func SetVendorID(vendorID string) {
+	if MSC != nil {
+		MSC.SetVendorID(vendorID)
+	}
+}
+func SetProductID(productID string) {
+	if MSC != nil {
+		MSC.SetProductID(productID)
+	}
+}
+func SetProductRev(productRev string) {
+	if MSC != nil {
+		MSC.SetProductRev(productRev)
+	}
+}

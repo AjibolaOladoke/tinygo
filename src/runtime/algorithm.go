@@ -1,0 +1,79 @@
+package runtime
+
+// This file implements various core algorithms used in the runtime package and
+// standard library.
+
+import (
+	"unsafe"
+)
+
+// interp folds fastrand and fastrand64 at build time. Init code that needs
+// device randomness must use rand.
+func fastrand() uint32 {
+	xorshift32State = xorshift32(xorshift32State)
+	return xorshift32State
+}
+
+// fastrandn is the equivalent of fastrand()%n, but faster. Some packages
+// (e.g. wireguard-go's device/timers.go) reach it via
+// //go:linkname ... runtime.fastrandn, so it must exist in the runtime.
+func fastrandn(n uint32) uint32 {
+	// See https://lemire.me/blog/2016/06/30/fast-random-shuffling/
+	return uint32(uint64(fastrand()) * uint64(n) >> 32)
+}
+
+func initRand() {
+	r, _ := hardwareRand()
+	xorshift64State = uint64(r | 1) // protect against 0
+	xorshift32State = uint32(xorshift64State)
+}
+
+var xorshift32State uint32 = 1
+
+// Keep this the same as the copy in interp/interp.go.
+func xorshift32(x uint32) uint32 {
+	// Algorithm "xor" from p. 4 of Marsaglia, "Xorshift RNGs".
+	// Improved sequence based on
+	// http://www.iro.umontreal.ca/~lecuyer/myftp/papers/xorshift.pdf
+	x ^= x << 7
+	x ^= x >> 1
+	x ^= x << 9
+	return x
+}
+
+func fastrand64() uint64 {
+	xorshift64State = xorshiftMult64(xorshift64State)
+	return xorshift64State
+}
+
+var xorshift64State uint64 = 1
+
+// 64-bit xorshift multiply rng from http://vigna.di.unimi.it/ftp/papers/xorshift.pdf
+// Keep this the same as the copy in interp/interp.go.
+func xorshiftMult64(x uint64) uint64 {
+	x ^= x >> 12 // a
+	x ^= x << 25 // b
+	x ^= x >> 27 // c
+	return x * 2685821657736338717
+}
+
+// This function is used by hash/maphash.
+func memhash(p unsafe.Pointer, seed, s uintptr) uintptr {
+	if unsafe.Sizeof(uintptr(0)) > 4 {
+		return uintptr(hash64(p, s, seed))
+	}
+	return uintptr(hash32(p, s, seed))
+}
+
+// Function that's called from various packages starting with Go 1.22.
+func rand() uint64 {
+	// Return a random number from hardware, falling back to software if
+	// unavailable.
+	n, ok := hardwareRand()
+	if !ok {
+		// Fallback to static random number.
+		// Not great, but we can't do much better than this.
+		n = fastrand64()
+	}
+	return n
+}

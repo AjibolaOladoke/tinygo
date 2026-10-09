@@ -1,0 +1,276 @@
+package transform_test
+
+// This file defines some helper functions for testing transforms.
+
+import (
+	"flag"
+	"go/token"
+	"go/types"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/tinygo-org/tinygo/compileopts"
+	"github.com/tinygo-org/tinygo/compiler"
+	"github.com/tinygo-org/tinygo/loader"
+	"tinygo.org/x/go-llvm"
+)
+
+var update = flag.Bool("update", false, "update transform package tests")
+
+var defaultTestConfig = &compileopts.Config{
+	Target:  &compileopts.TargetSpec{},
+	Options: &compileopts.Options{Opt: "2"},
+}
+
+// checkGolden compares got against the golden file at path, or rewrites that
+// file when the test is run with -update.
+func checkGolden(t *testing.T, path, got string) {
+	if *update {
+		if err := os.WriteFile(path, []byte(got), 0o666); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Errorf("%s does not match expected output:\n%s", path, got)
+	}
+}
+
+// testTransform runs a transformation pass on an input file (pathPrefix+".ll")
+// and checks whether it matches the expected output (pathPrefix+".out.ll"). The
+// output is compared with a fuzzy match that ignores some irrelevant lines such
+// as empty lines.
+func testTransform(t *testing.T, pathPrefix string, transform func(mod llvm.Module)) {
+	// Read the input IR.
+	ctx := llvm.NewContext()
+	defer ctx.Dispose()
+	ensureTestCacheFreshness(t, pathPrefix+".ll")
+	buf, err := llvm.NewMemoryBufferFromFile(pathPrefix + ".ll")
+	if err != nil {
+		t.Fatalf("could not read file %s: %v", pathPrefix+".ll", err)
+	}
+	mod, err := ctx.ParseIR(buf)
+	if err != nil {
+		t.Fatalf("could not load module:\n%v", err)
+	}
+	defer mod.Dispose()
+
+	// Perform the transform.
+	transform(mod)
+
+	// Check for any incorrect IR.
+	err = llvm.VerifyModule(mod, llvm.PrintMessageAction)
+	if err != nil {
+		t.Fatal("IR verification failed")
+	}
+
+	// Get the output from the test and filter some irrelevant lines.
+	actual := mod.String()
+	actual = actual[strings.Index(actual, "\ntarget datalayout = ")+1:]
+
+	if *update {
+		err := os.WriteFile(pathPrefix+".out.ll", []byte(normalizeIR(actual)), 0666)
+		if err != nil {
+			t.Error("failed to write out new output:", err)
+		}
+	} else {
+		// Read the expected output IR.
+		out, err := os.ReadFile(pathPrefix + ".out.ll")
+		if err != nil {
+			t.Fatalf("could not read output file %s: %v", pathPrefix+".out.ll", err)
+		}
+
+		// See whether the transform output matches with the expected output IR.
+		expected := string(out)
+		if !fuzzyEqualIR(expected, actual) {
+			t.Logf("output does not match expected output:\n%s", actual)
+			t.Fail()
+		}
+	}
+}
+
+// fuzzyEqualIR returns true if the two LLVM IR strings passed in are roughly
+// equal. That means, only relevant lines are compared (excluding comments
+// etc.).
+func fuzzyEqualIR(s1, s2 string) bool {
+	s1 = normalizeIR(s1)
+	s2 = normalizeIR(s2)
+
+	lines1 := filterIrrelevantIRLines(strings.Split(s1, "\n"))
+	lines2 := filterIrrelevantIRLines(strings.Split(s2, "\n"))
+	if len(lines1) != len(lines2) {
+		return false
+	}
+	for i, line1 := range lines1 {
+		line2 := lines2[i]
+		if line1 != line2 {
+			return false
+		}
+	}
+
+	return true
+}
+
+func normalizeIR(s string) string {
+	// Golden files are written using the pre-LLVM21 'nocapture' spelling,
+	// which LLVM printed before any co-occurring attribute such as
+	// 'readonly' (e.g. "ptr nocapture readonly"). LLVM 21+ prints the
+	// equivalent 'captures(none)' instead, and after such attributes (e.g.
+	// "ptr readonly captures(none)"). Normalize both name and position back
+	// to the old spelling.
+	s = normalizeCapturesAttr(s)
+
+	// LLVM 21+ also added an explicit 'nocreateundeforpoison' attribute to
+	// certain intrinsic declarations (e.g. llvm.umin) that were implicitly
+	// assumed not to create undef/poison before. It's unrelated to the
+	// escape-analysis behavior under test, so ignore it for comparison.
+	s = strings.ReplaceAll(s, "nocreateundeforpoison ", "")
+
+	// LLVM 22 dropped the (redundant) i64 size argument from
+	// llvm.lifetime.start/end. Normalize away that argument so golden files
+	// written against the two-argument form still match.
+	s = lifetimeSizeArgRe.ReplaceAllString(s, "$1")
+
+	return s
+}
+
+// capturesNoneAttrRe matches a co-occurring attribute directly followed by
+// 'captures(none)', which is how LLVM 21+ orders these two attributes when
+// printing IR (the pre-LLVM21 'nocapture' attribute printed the other way
+// around).
+var capturesNoneAttrRe = regexp.MustCompile(`\b(readonly|readnone|writeonly|nonnull)\s+captures\(none\)`)
+
+// lifetimeSizeArgRe matches the i64 size argument of an
+// llvm.lifetime.start/end call or declaration, which LLVM 22 removed.
+var lifetimeSizeArgRe = regexp.MustCompile(`(@llvm\.lifetime\.(?:start|end)\.p0\()i64(?: immarg| \d+), `)
+
+// normalizeCapturesAttr rewrites LLVM 21+'s 'captures(none)' attribute back
+// to the pre-LLVM21 'nocapture' spelling and position, so golden IR files
+// written against LLVM <21 keep matching.
+func normalizeCapturesAttr(s string) string {
+	s = capturesNoneAttrRe.ReplaceAllString(s, "nocapture $1")
+	s = strings.ReplaceAll(s, "captures(none)", "nocapture")
+	return s
+}
+
+// filterIrrelevantIRLines removes lines from the input slice of strings that
+// are not relevant in comparing IR. For example, empty lines and comments are
+// stripped out.
+func filterIrrelevantIRLines(lines []string) []string {
+	var out []string
+	for _, line := range lines {
+		line = strings.Split(line, ";")[0]    // strip out comments/info
+		line = strings.TrimRight(line, "\r ") // drop '\r' on Windows and remove trailing spaces from comments
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "source_filename = ") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// compileGoFileForTesting compiles the given Go file to run tests against.
+// Only the given Go file is compiled (no dependencies) and no optimizations are
+// run.
+// If there are any errors, they are reported via the *testing.T instance.
+func compileGoFileForTesting(t *testing.T, filename string) llvm.Module {
+	target, err := compileopts.LoadTarget(&compileopts.Options{GOOS: "linux", GOARCH: "386"})
+	if err != nil {
+		t.Fatal("failed to load target:", err)
+	}
+	config := &compileopts.Config{
+		Options: &compileopts.Options{},
+		Target:  target,
+	}
+	compilerConfig := &compiler.Config{
+		Triple:             config.Triple(),
+		GOOS:               config.GOOS(),
+		GOARCH:             config.GOARCH(),
+		CodeModel:          config.CodeModel(),
+		RelocationModel:    config.RelocationModel(),
+		Scheduler:          config.Scheduler(),
+		AutomaticStackSize: config.AutomaticStackSize(),
+		Debug:              true,
+		PanicStrategy:      config.PanicStrategy(),
+		PanicUnwind:        config.PanicUnwind(),
+	}
+	machine, err := compiler.NewTargetMachine(compilerConfig)
+	if err != nil {
+		t.Fatal("failed to create target machine:", err)
+	}
+	defer machine.Dispose()
+
+	// Load entire program AST into memory.
+	lprogram, err := loader.Load(config, filename, types.Config{
+		Sizes: compiler.Sizes(machine),
+	})
+	if err != nil {
+		t.Fatal("failed to create target machine:", err)
+	}
+	err = lprogram.Parse()
+	if err != nil {
+		t.Fatal("could not parse", err)
+	}
+
+	// Compile AST to IR.
+	program := lprogram.LoadSSA()
+	pkg := lprogram.MainPkg()
+	ssaPkg := program.Package(pkg.Pkg)
+	ssaPkg.Build()
+	mod, errs := compiler.CompilePackage(filename, pkg, ssaPkg, machine, compilerConfig, false)
+	if errs != nil {
+		for _, err := range errs {
+			t.Error(err)
+		}
+		t.FailNow()
+	}
+	return mod
+}
+
+// getPosition returns the position information for the given value, as far as
+// it is available.
+func getPosition(val llvm.Value) token.Position {
+	if !val.IsAInstruction().IsNil() {
+		loc := val.InstructionDebugLoc()
+		if loc.IsNil() {
+			return token.Position{}
+		}
+		file := loc.LocationScope().ScopeFile()
+		return token.Position{
+			Filename: filepath.Join(file.FileDirectory(), file.FileFilename()),
+			Line:     int(loc.LocationLine()),
+			Column:   int(loc.LocationColumn()),
+		}
+	} else if !val.IsAFunction().IsNil() {
+		loc := val.Subprogram()
+		if loc.IsNil() {
+			return token.Position{}
+		}
+		file := loc.ScopeFile()
+		return token.Position{
+			Filename: filepath.Join(file.FileDirectory(), file.FileFilename()),
+			Line:     int(loc.SubprogramLine()),
+		}
+	} else {
+		return token.Position{}
+	}
+}
+
+// ensureTestCacheFreshness registers path as an input of the running test.
+// see https://github.com/tinygo-org/tinygo/issues/5780.
+func ensureTestCacheFreshness(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("could not stat test fixture %s: %v", path, err)
+	}
+}
