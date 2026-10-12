@@ -201,3 +201,11 @@ Compiled and maintained from upstream [tinygo-org/tinygo](https://github.com/tin
 ---
 
 Maintained by [Swift Tech Co.](https://github.com/Swift-Tech-Co) - [Telegram](https://t.me/+Qt_eFvkb2rliMzNh)
+
+## Sources
+
+Compiled and maintained from upstream [tinygo-org/tinygo](https://github.com/tinygo-org/tinygo) under permissive open-source license.
+
+---
+
+Maintained by [Swift Tech Co.](https://github.com/Swift-Tech-Co) - [Telegram](https://t.me/+Qt_eFvkb2rliMzNh)
