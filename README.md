@@ -6,7 +6,7 @@ We keep a working index for product and engineering, and tinygo is the entry tha
 
 ## Images
 
-[![tinygo](images/preview.png)](https://github.com/Swift-Tech-Co)
+[![tinygo](images/preview.png)](https://github.com/Swift-Tech-Co/tinygo)
 
 ## Embedded
 
@@ -78,13 +78,13 @@ See the getting started instructions for information on how to install TinyGo, a
 
 You can compile TinyGo programs for over 150 different microcontroller boards.
 
-For more information, please see https://www.swifttechco.com
+For more information, please see https://github.com/Swift-Tech-Co/tinygo
 
 ### WebAssembly
 
 TinyGo programs can be compiled for both WASM and WASI targets.
 
-For more information, see https://www.swifttechco.com
+For more information, see https://github.com/Swift-Tech-Co/tinygo
 
 ### Operating Systems
 
@@ -92,21 +92,21 @@ You can also compile programs for Linux, macOS, and Windows targets.
 
 For more information:
 
-- Linux https://www.swifttechco.com
+- Linux https://github.com/Swift-Tech-Co/tinygo
 
-- macOS https://www.swifttechco.com
+- macOS https://github.com/Swift-Tech-Co/tinygo
 
-- Windows https://www.swifttechco.com
+- Windows https://github.com/Swift-Tech-Co/tinygo
 
 ## Currently supported features:
 
-For a description of currently supported Go language features, please see https://www.swifttechco.com.
+For a description of currently supported Go language features, please see https://github.com/Swift-Tech-Co/tinygo.
 
 ## Documentation
 
-Documentation is located on our web site at https://www.swifttechco.com.
+Documentation is located on our web site at https://github.com/Swift-Tech-Co/tinygo.
 
-You can find the web site code at https://www.swifttechco.com.
+You can find the web site code at https://github.com/Swift-Tech-Co/tinygo.
 
 ## Getting help
 
@@ -115,7 +115,7 @@ development, we have a #TinyGo channel
 on the Gophers Slack.
 
 If you need an invitation for the Gophers Slack, you can generate one here which
-should arrive fairly quickly (under 1 min): https://www.swifttechco.com
+should arrive fairly quickly (under 1 min): https://github.com/Swift-Tech-Co/tinygo
 
 ## Contributing
 
@@ -171,13 +171,21 @@ Home | Services | Careers | Referral Program | Influencers | About | Contact
 
 **Connect**
 
-- Website: swifttechco.com
+- Website: https://github.com/Swift-Tech-Co/tinygo
 - LinkedIn: [linkedin.com/in/stephenoladoke](https://www.linkedin.com/in/stephenoladoke/)
 - LinkedIn (Company): [linkedin.com/company/swift-tech-co](https://www.linkedin.com/company/swift-tech-co)
 - X: [@MrOladoke](https://x.com/MrOladoke)
 - Instagram: [@mr.oladoke](https://www.instagram.com/mr.oladoke/)
 - Instagram (Company): [@swifttechco](https://www.instagram.com/swifttechco/)
 - Organization: [github.com/Swift-Tech-Co](https://github.com/Swift-Tech-Co)
+
+## Sources
+
+Compiled and maintained from upstream [tinygo-org/tinygo](https://github.com/tinygo-org/tinygo) under permissive open-source license.
+
+---
+
+Maintained by [Swift Tech Co.](https://github.com/Swift-Tech-Co) - [Telegram](https://t.me/+Qt_eFvkb2rliMzNh)
 
 ## Sources
 
